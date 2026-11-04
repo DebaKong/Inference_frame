@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn.functional as F
@@ -45,6 +45,7 @@ class Qwen3Attention(BaseOP):
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         attention_mask: torch.Tensor,
+        kv_cache: Any | None = None,
     ) -> torch.Tensor:
         B, S, _ = hidden_states.shape
 
@@ -57,6 +58,10 @@ class Qwen3Attention(BaseOP):
 
         cos, sin = position_embeddings
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
+
+        # 更新 KV cache 并取回完整的历史 k/v(含当前 step)
+        if kv_cache is not None:
+            k, v = kv_cache.update(self._layer_idx, k, v)
 
         k = repeat_kv(k, self.num_kv_groups)
         v = repeat_kv(v, self.num_kv_groups)
@@ -87,15 +92,16 @@ class Qwen3MLP(BaseOP):
 
 class Qwen3DecoderLayer(BaseOP):
     def __init__(self, config: ModelConfig, layer_idx: int):
+        self._layer_idx = layer_idx
         self.self_attn = Qwen3Attention(config, layer_idx)
         self.mlp = Qwen3MLP(config)
         self.input_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
 
-    def forward(self, hidden_states: torch.Tensor, attention_mask: torch.Tensor, position_embeddings: tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor, attention_mask: torch.Tensor, position_embeddings: tuple[torch.Tensor, torch.Tensor], kv_cache: Any | None = None) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.input_layernorm.forward(hidden_states)
-        hidden_states = self.self_attn.forward(hidden_states, position_embeddings, attention_mask)
+        hidden_states = self.self_attn.forward(hidden_states, position_embeddings, attention_mask, kv_cache = kv_cache)
         hidden_states = hidden_states + residual
 
         residual = hidden_states
@@ -113,18 +119,30 @@ class Qwen3Model(BaseOP):
         self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self._rotary_emb = RotaryEmbedding(config.head_dim, config.max_position_embeddings, config.rope_theta)
 
-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-        B, S = input_ids.shape
+    def forward(self, input_ids: torch.Tensor, kv_cache: Any | None = None) -> torch.Tensor:
+        bsz, seq_len = input_ids.shape
         hidden_states = self.embed_tokens.forward(input_ids)
 
-        position_ids = torch.arange(S, device=input_ids.device).unsqueeze(0).expand(B, -1)
+        past_len = kv_cache.get_seq_len() if kv_cache is not None else 0
+
+        position_ids = torch.arange(past_len, past_len + seq_len, device=input_ids.device).unsqueeze(0).expand(bsz, -1)
         position_embeddings = self._rotary_emb.forward(position_ids)
 
-        causal_mask = torch.full((S, S), float("-inf"), device = input_ids.device, dtype = hidden_states.dtype)
-        causal_mask = torch.triu(causal_mask, diagonal=1).unsqueeze(0).unsqueeze(0)
+        # 标准因果掩码:shape (B, 1, S, total),上三角(未来位置)置 -inf
+        total_kv_len = past_len + seq_len
+        q_positions = torch.arange(past_len, past_len + seq_len, device=input_ids.device).unsqueeze(0)  # (1, S)
+        k_positions = torch.arange(total_kv_len, device=input_ids.device).unsqueeze(0)                  # (1, total)
+        # (1, S, total): 当 k 位置 > q 位置(即未来)时为 True
+        future_mask = k_positions.unsqueeze(1) > q_positions.unsqueeze(-1)  # (1, S, total)
+        causal_mask = torch.where(
+            future_mask,
+            torch.tensor(float("-inf"), device=input_ids.device, dtype=hidden_states.dtype),
+            torch.tensor(0.0, device=input_ids.device, dtype=hidden_states.dtype),
+        )
+        causal_mask = causal_mask.unsqueeze(0)  # (1, 1, S, total)
 
         for layer in self.layers.op_list:
-            hidden_states = layer.forward(hidden_states, causal_mask, position_embeddings)
+            hidden_states = layer.forward(hidden_states, causal_mask, position_embeddings, kv_cache = kv_cache)
 
         return self.norm.forward(hidden_states)
 
@@ -140,6 +158,6 @@ class Qwen3ForCausalLM(BaseLLMModel):
             tied_embedding = self.model.embed_tokens if config.tie_word_embeddings else None,
         )
 
-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-        hidden_states = self.model.forward(input_ids)
+    def forward(self, input_ids: torch.Tensor, kv_cache: Any | None = None) -> torch.Tensor:
+        hidden_states = self.model.forward(input_ids, kv_cache = kv_cache)
         return self.lm_head.forward(hidden_states)

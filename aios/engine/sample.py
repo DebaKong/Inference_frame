@@ -23,6 +23,6 @@ class Sampler:
         if self.sampling_params.top_k > 0:
             topk_vals = torch.topk(logits, min(self.sampling_params.top_k, logits.size(-1))).values
             logits = logits.masked_fill(logits < topk_vals[..., -1:], float("-inf"))
-            probs = F.softmax(logits, dim = -1)
-            return torch.multinomial(probs, num_samples = 1)
+        probs = F.softmax(logits, dim = -1)
+        return torch.multinomial(probs, num_samples = 1)
         

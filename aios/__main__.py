@@ -20,6 +20,7 @@ def main():
     parser.add_argument("--temperature", type=float, default=0.0, help="Sampling temperature (0 = greedy)")
     parser.add_argument("--top-k", type=int, default=-1, help="Top-k sampling (-1 = disabled)")
     parser.add_argument("--device", type=str, default="cuda", help="Device to use (e.g. cuda, cuda:0, cuda:1)")
+    parser.add_argument("--no-kv-cache", action="store_true", help="Disable lesson-4 dynamic KV cache path")
     args = parser.parse_args()
 
     print(f"Loading model from {args.model}...")
@@ -34,7 +35,7 @@ def main():
         max_tokens=args.max_tokens,
     )
 
-    results = llm.generate([args.prompt], sampling_params)
+    results = llm.generate([args.prompt], sampling_params, use_kv_cache=not args.no_kv_cache)
     for r in results:
         print(r["text"])
 

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from aios.layers import BaseOP
 
@@ -11,5 +11,5 @@ if TYPE_CHECKING:
 
 class BaseLLMModel(ABC, BaseOP):
     @abstractmethod
-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor: ...
+    def forward(self, input_ids: torch.Tensor, kv_cache: Any | None = None) -> torch.Tensor: ...
     
