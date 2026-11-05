@@ -5,7 +5,7 @@ from typing import List
 
 import torch
 
-from aios.core import SamplingParams
+from aios.core import SamplingParams, Req
 from aios.engine import Sampler, DynamicKVCache
 from aios.llm import LLM
 
@@ -15,9 +15,15 @@ def run_one_sequence(
     input_ids: torch.Tensor,
     sampling_params: SamplingParams,
     use_kv_cache: bool,
+    use_paged_kv_cache: bool,
     sync: bool = True,
 ) -> dict:
     """Drive a single sequence end-to-end and collect timing metrics.
+
+    Supports three modes:
+      - no cache          : recompute full sequence every step
+      - dynamic KV cache  : grows with torch.cat (lesson-4)
+      - paged KV cache    : pre-allocated paged pool (lesson-6)
 
     Returns a dict with:
       - ttft:        time from first forward to first generated token (prefill)
@@ -30,34 +36,56 @@ def run_one_sequence(
     device = llm.device
     sampler = Sampler(sampling_params)
     num_layers = llm._num_layers
-
-    kv_cache = DynamicKVCache(num_layers) if use_kv_cache else None
-    generated = input_ids.clone()
+    eos = llm.tokenizer.eos_token_id
 
     def _sync():
         if sync and device.type == "cuda":
             torch.cuda.synchronize()
 
+    # ---- 按模式初始化 KV cache 与 req ----
+    kv_cache = None
+    req = None
+    if use_paged_kv_cache:
+        # 复用 LLM 内部的 paged 内存池与页管理器
+        block_table = llm.cache_manager.allocate(input_ids.shape[1])
+        req = Req(
+            input_ids=input_ids[0],
+            cached_len=0,
+            output_len=sampling_params.max_tokens,
+            uid=0,
+            sampling_params=sampling_params,
+            block_table=block_table,
+        )
+    elif use_kv_cache:
+        kv_cache = DynamicKVCache(num_layers)
+
+    generated = input_ids.clone()
+
+    def _forward(model_input):
+        if use_paged_kv_cache:
+            assert req is not None
+            return llm.model.forward(model_input, paged_kv_cache=llm.mha_kv_cache, req=req)
+        return llm.model.forward(model_input, kv_cache=kv_cache)
+
     # ---- prefill: 一次性前向完整 prompt ----
     _sync()
     t_prefill_start = time.perf_counter()
-    logits = llm.model.forward(input_ids, kv_cache=kv_cache)
+    logits = _forward(input_ids)
     next_logits = logits[:, -1, :]
     next_token = sampler.sample(next_logits)
     _sync()
     prefill_time = time.perf_counter() - t_prefill_start
 
     generated = torch.cat([generated, next_token], dim=-1)
-    eos = llm.tokenizer.eos_token_id
 
     # ---- decode: 逐个 token 生成 ----
     decode_times: List[float] = []
-    model_input = next_token if use_kv_cache else generated
+    model_input = next_token if (use_kv_cache or use_paged_kv_cache) else generated
 
     for _ in range(sampling_params.max_tokens - 1):
         _sync()
         t_step_start = time.perf_counter()
-        logits = llm.model.forward(model_input, kv_cache=kv_cache)
+        logits = _forward(model_input)
         next_logits = logits[:, -1, :]
         next_token = sampler.sample(next_logits)
         _sync()
@@ -67,7 +95,18 @@ def run_one_sequence(
         generated = torch.cat([generated, next_token], dim=-1)
         if not sampling_params.ignore_eos and next_token.item() == eos:
             break
-        model_input = next_token if use_kv_cache else generated
+
+        if use_paged_kv_cache:
+            assert req is not None and req.block_table is not None
+            req.complete_one()
+            new_block = llm.cache_manager.allocate(1)
+            req.block_table = torch.cat([req.block_table, new_block])
+
+        model_input = next_token if (use_kv_cache or use_paged_kv_cache) else generated
+
+    # ---- 释放 paged 页 ----
+    if req is not None and req.block_table is not None:
+        llm.cache_manager._free(req.block_table[: req.cached_len])
 
     output_tokens = generated.shape[1] - input_ids.shape[1]
     decode_time = sum(decode_times)
@@ -89,6 +128,7 @@ def main():
     parser.add_argument("--max-input-len", type=int, default=1024)
     parser.add_argument("--max-output-len", type=int, default=1024)
     parser.add_argument("--no-kv-cache", action="store_true", help="Disable lesson-4 KV cache path")
+    parser.add_argument("--paged-kv-cache", action="store_true", help="Enable lesson-6 Paged KV cache")
     parser.add_argument("--no-sync", action="store_true", help="Skip cuda.synchronize timing (noisier, faster)")
     args = parser.parse_args()
 
@@ -112,13 +152,13 @@ def main():
     sync = not args.no_sync
 
     # warm up
-    llm.generate(["Benchmark: "], SamplingParams(temperature=0.1), use_kv_cache=use_kv_cache)
+    llm.generate(["Benchmark: "], SamplingParams(temperature=0.1), use_kv_cache=use_kv_cache, use_paged_kv_cache=args.paged_kv_cache)
 
     # ---- 正式 benchmark ----
     results = []
     for token_ids, sp in zip(prompt_token_ids, sampling_params):
         input_ids = torch.tensor([token_ids], dtype=torch.long, device=llm.device)
-        results.append(run_one_sequence(llm, input_ids, sp, use_kv_cache, sync=sync))
+        results.append(run_one_sequence(llm, input_ids, sp, use_kv_cache, use_paged_kv_cache=args.paged_kv_cache, sync=sync))
 
     # ---- 汇总指标 ----
     total_output_tokens = sum(r["output_tokens"] for r in results)
@@ -136,7 +176,7 @@ def main():
     # 吞吐量
     throughput = total_output_tokens / total_time
 
-    mode = "NO_CACHE" if args.no_kv_cache else "KV_CACHE"
+    mode = "PAGED_KV_CACHE" if args.paged_kv_cache else ("NO_CACHE" if args.no_kv_cache else "KV_CACHE")
     print("=" * 64)
     print(f"[{mode}] AIOS Benchmark Results")
     print("=" * 64)

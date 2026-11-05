@@ -8,8 +8,10 @@ from huggingface_hub import snapshot_download
 from transformers import AutoConfig, AutoTokenizer
 
 from ..models import ModelConfig, create_model, load_weights
-from ..engine import Sampler, DynamicKVCache 
-from ..core import SamplingParams
+from ..engine import Sampler, DynamicKVCache
+from ..kvcache import MHAKVCache, KVCacheLayout
+from ..scheduler import CacheManager 
+from ..core import SamplingParams, Req
 
 
 def _resolve_model_path(model_path: str) -> str:
@@ -40,12 +42,28 @@ class LLM:
 
         self.tokenizer = AutoTokenizer.from_pretrained(model_path)
 
+        # Paged KV Cache Memory Pool
+        self.num_pages = 2048 # ~128MB per token/layer pool
+        self.mha_kv_cache = MHAKVCache(
+            num_kv_heads=config.num_kv_heads,
+            num_layers=config.num_layers,
+            head_dim=config.head_dim,
+            num_pages=self.num_pages,
+            dtype=self.dtype,
+            kv_layout=KVCacheLayout.LayerFirst,
+            device=self.device,
+            page_size=1
+        )
+        self.cache_manager = CacheManager(self.device, self.num_pages)
+
+
     @torch.no_grad()
     def generate(
         self,
         prompts: List[str] | List[List[int]],
         sampling_params: SamplingParams | List[SamplingParams] | None = None,
         use_kv_cache: bool = True,
+        use_paged_kv_cache: bool = False,
     ) -> List[dict]:
         # 归一化 sampling_params:统一为「每个 prompt 对应一个 SamplingParams」的列表
         if sampling_params is None:
@@ -75,11 +93,31 @@ class LLM:
             sampler = Sampler(sp)
             generated = input_ids.clone()
 
-            kv_cache = DynamicKVCache(self._num_layers) if use_kv_cache else None
+            kv_cache = None
+            req: Req | None =  None
+            
+            if use_paged_kv_cache:
+                block_table = self.cache_manager.allocate(input_ids.shape[1])
+                req = Req(
+                    input_ids=input_ids[0],
+                    cached_len=0,
+                    output_len=sp.max_tokens,
+                    uid=0,
+                    sampling_params=sp,
+                    block_table=block_table,
+                )
+            elif use_kv_cache:
+                kv_cache = DynamicKVCache(self._num_layers)
+            
             model_input = input_ids
 
-            for _ in range(sp.max_tokens):
-                logits = self.model.forward(model_input, kv_cache = kv_cache)
+            for step in range(sp.max_tokens):
+                if use_paged_kv_cache:
+                    assert req is not None
+                    logits = self.model.forward(model_input, paged_kv_cache = self.mha_kv_cache, req=req)
+                else:
+                    logits = self.model.forward(model_input, kv_cache = kv_cache)
+                
                 next_logits = logits[:, -1, :]
                 next_token = sampler.sample(next_logits)
 
@@ -87,10 +125,20 @@ class LLM:
                 if not sp.ignore_eos and next_token.item() == self.tokenizer.eos_token_id:
                     break
 
-                model_input = next_token if use_kv_cache else generated
+                if use_paged_kv_cache:
+                    assert req is not None and req.block_table is not None
+                    req.complete_one()
+                    new_block = self.cache_manager.allocate(1)
+                    req.block_table = torch.cat([req.block_table, new_block])
+                
+                model_input = next_token if (kv_cache is not None or use_paged_kv_cache) else generated
 
+            if req is not None and req.block_table is not None:
+                self.cache_manager._free(req.block_table[: req.cached_len])
+            
             new_token_ids = generated[0][input_ids.shape[1]:].tolist()
             text = self.tokenizer.decode(new_token_ids, skip_special_tokens = True)
             results.append({"text": text, "token_ids": new_token_ids})
 
         return results
+    

@@ -21,6 +21,8 @@ from .base import BaseLLMModel
 
 if TYPE_CHECKING:
     from .config import ModelConfig
+    from aios.kvcache import MHAKVCache
+    from aios.core import Req
 
 
 class Qwen3Attention(BaseOP):
@@ -46,6 +48,8 @@ class Qwen3Attention(BaseOP):
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         attention_mask: torch.Tensor,
         kv_cache: Any | None = None,
+        paged_kv_cache: MHAKVCache | None = None,
+        req: Req | None = None,
     ) -> torch.Tensor:
         B, S, _ = hidden_states.shape
 
@@ -60,7 +64,22 @@ class Qwen3Attention(BaseOP):
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
         # 更新 KV cache 并取回完整的历史 k/v(含当前 step)
-        if kv_cache is not None:
+        if paged_kv_cache is not None:
+            assert req is not None and req.block_table is not None, "req.block_table is required with paged_kv_cache"
+            assert B == 1, "Paged KV path only supports bsz=1 in current lesson path"
+            
+            block_table = req.block_table
+            out_loc = block_table[req.cached_len : req.cached_len + S]
+            
+            k_to_store = k[0].transpose(0, 1)
+            v_to_store = v[0].transpose(0, 1)
+            paged_kv_cache.store_kv(k_to_store, v_to_store, out_loc, self._layer_idx)
+
+            all_locs = block_table[: req.cached_len + S]
+            k = paged_kv_cache.k_cache(self._layer_idx)[all_locs, :, 0, :].transpose(0, 1).unsqueeze(0)
+            v = paged_kv_cache.v_cache(self._layer_idx)[all_locs, :, 0, :].transpose(0, 1).unsqueeze(0)
+
+        elif kv_cache is not None:
             k, v = kv_cache.update(self._layer_idx, k, v)
 
         k = repeat_kv(k, self.num_kv_groups)
@@ -98,10 +117,18 @@ class Qwen3DecoderLayer(BaseOP):
         self.input_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
 
-    def forward(self, hidden_states: torch.Tensor, attention_mask: torch.Tensor, position_embeddings: tuple[torch.Tensor, torch.Tensor], kv_cache: Any | None = None) -> torch.Tensor:
+    def forward(
+            self,
+            hidden_states: torch.Tensor,
+            attention_mask: torch.Tensor,
+            position_embeddings: tuple[torch.Tensor, torch.Tensor],
+            kv_cache: Any | None = None,
+            paged_kv_cache: MHAKVCache | None = None,
+            req: Req | None = None,
+    ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.input_layernorm.forward(hidden_states)
-        hidden_states = self.self_attn.forward(hidden_states, position_embeddings, attention_mask, kv_cache = kv_cache)
+        hidden_states = self.self_attn.forward(hidden_states, position_embeddings, attention_mask, kv_cache = kv_cache, paged_kv_cache=paged_kv_cache, req=req)
         hidden_states = hidden_states + residual
 
         residual = hidden_states
@@ -119,11 +146,15 @@ class Qwen3Model(BaseOP):
         self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self._rotary_emb = RotaryEmbedding(config.head_dim, config.max_position_embeddings, config.rope_theta)
 
-    def forward(self, input_ids: torch.Tensor, kv_cache: Any | None = None) -> torch.Tensor:
+    def forward(self, input_ids: torch.Tensor, kv_cache: Any | None = None, paged_kv_cache: MHAKVCache | None = None, req: Req | None = None) -> torch.Tensor:
         bsz, seq_len = input_ids.shape
         hidden_states = self.embed_tokens.forward(input_ids)
 
-        past_len = kv_cache.get_seq_len() if kv_cache is not None else 0
+        if paged_kv_cache is not None:
+            assert req is not None, "req is required with paged_kv_cache"
+            past_len = req.cached_len
+        else:
+            past_len = kv_cache.get_seq_len() if kv_cache is not None else 0
 
         position_ids = torch.arange(past_len, past_len + seq_len, device=input_ids.device).unsqueeze(0).expand(bsz, -1)
         position_embeddings = self._rotary_emb.forward(position_ids)
@@ -142,7 +173,7 @@ class Qwen3Model(BaseOP):
         causal_mask = causal_mask.unsqueeze(0)  # (1, 1, S, total)
 
         for layer in self.layers.op_list:
-            hidden_states = layer.forward(hidden_states, causal_mask, position_embeddings, kv_cache = kv_cache)
+            hidden_states = layer.forward(hidden_states, causal_mask, position_embeddings, kv_cache = kv_cache, paged_kv_cache=paged_kv_cache, req=req)
 
         return self.norm.forward(hidden_states)
 
@@ -158,6 +189,6 @@ class Qwen3ForCausalLM(BaseLLMModel):
             tied_embedding = self.model.embed_tokens if config.tie_word_embeddings else None,
         )
 
-    def forward(self, input_ids: torch.Tensor, kv_cache: Any | None = None) -> torch.Tensor:
-        hidden_states = self.model.forward(input_ids, kv_cache = kv_cache)
+    def forward(self, input_ids: torch.Tensor, kv_cache: Any | None = None, paged_kv_cache: MHAKVCache | None = None, req: Req | None = None) -> torch.Tensor:
+        hidden_states = self.model.forward(input_ids, kv_cache = kv_cache, paged_kv_cache=paged_kv_cache, req=req)
         return self.lm_head.forward(hidden_states)

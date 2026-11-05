@@ -11,5 +11,5 @@ if TYPE_CHECKING:
 
 class BaseLLMModel(ABC, BaseOP):
     @abstractmethod
-    def forward(self, input_ids: torch.Tensor, kv_cache: Any | None = None) -> torch.Tensor: ...
+    def forward(self, input_ids: torch.Tensor, kv_cache: Any | None = None, paged_kv_cache: Any | None = None, req: Any | None = None) -> torch.Tensor: ...
     
