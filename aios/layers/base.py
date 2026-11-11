@@ -64,7 +64,7 @@ class StateLessOP(BaseOP):
     def __init__(self):
         super().__init__()
     
-    def load_state_dict(self, state_dict: _STATE_DICT, *, prefix: str = "", _intenal: bool = False) -> None:
+    def load_state_dict(self, state_dict: _STATE_DICT, *, prefix: str = "", _internal: bool = False) -> None:
         if not _internal and state_dict:
             raise RuntimeError(f"Unexpected keys in state_dict: {list(state_dict.keys())}")
         

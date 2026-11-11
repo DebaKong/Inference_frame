@@ -10,10 +10,50 @@ from aios.engine import Sampler, DynamicKVCache
 from aios.llm import LLM
 
 
+def run_static_batch(
+    llm: LLM,
+    prompt_token_ids: List[List[int]],
+    sampling_params: List[SamplingParams],
+    sync: bool = True,
+) -> dict:
+    """Drive static-batch generation and collect coarse timing metrics.
+
+    Static batching uses prefill-first + decode-loop, so per-token TTFT/TPOT
+    are not directly measurable from the outside; we report end-to-end time,
+    throughput, and per-phase time when available.
+    """
+    device = llm.device
+
+    def _sync():
+        if sync and device.type == "cuda":
+            torch.cuda.synchronize()
+
+    # 转成 token id 列表(与 _generate_static_batch_paged 接受的格式一致)
+    prompts = [ids for ids in prompt_token_ids]
+
+    _sync()
+    t_start = time.perf_counter()
+    results = llm.generate(
+        prompts,
+        sampling_params,
+        use_static_batch=True,
+    )
+    _sync()
+    total_time = time.perf_counter() - t_start
+
+    output_tokens = sum(len(r["token_ids"]) for r in results)
+    return {
+        "total_time": total_time,
+        "output_tokens": output_tokens,
+        "results": results,
+    }
+
+
 def run_one_sequence(
     llm: LLM,
     input_ids: torch.Tensor,
     sampling_params: SamplingParams,
+    req_id: int,
     use_kv_cache: bool,
     use_paged_kv_cache: bool,
     sync: bool = True,
@@ -52,7 +92,7 @@ def run_one_sequence(
             input_ids=input_ids[0],
             cached_len=0,
             output_len=sampling_params.max_tokens,
-            uid=0,
+            uid=req_id,
             sampling_params=sampling_params,
             block_table=block_table,
         )
@@ -129,6 +169,7 @@ def main():
     parser.add_argument("--max-output-len", type=int, default=1024)
     parser.add_argument("--no-kv-cache", action="store_true", help="Disable lesson-4 KV cache path")
     parser.add_argument("--paged-kv-cache", action="store_true", help="Enable lesson-6 Paged KV cache")
+    parser.add_argument("--static-batch", action="store_true", help="Enable static batching (paged KV + batched attention)")
     parser.add_argument("--no-sync", action="store_true", help="Skip cuda.synchronize timing (noisier, faster)")
     args = parser.parse_args()
 
@@ -151,14 +192,37 @@ def main():
     use_kv_cache = not args.no_kv_cache
     sync = not args.no_sync
 
+    # ---- static batching 分支 ----
+    if args.static_batch:
+        # warm up
+        llm.generate(["Benchmark: "], SamplingParams(temperature=0.1), use_static_batch=True)
+
+        res = run_static_batch(llm, prompt_token_ids, sampling_params, sync=sync)
+        total_output_tokens = res["output_tokens"]
+        total_time = res["total_time"]
+        throughput = total_output_tokens / total_time
+
+        print("=" * 64)
+        print("[STATIC_BATCH] AIOS Benchmark Results")
+        print("=" * 64)
+        print(f"  Sequences            : {args.num_seqs}")
+        print(f"  Total input tokens   : {sum(len(ids) for ids in prompt_token_ids)}")
+        print(f"  Total output tokens  : {total_output_tokens}")
+        print("-" * 64)
+        print(f"  Total time           : {total_time:.2f} s")
+        print(f"  Throughput           : {throughput:.2f} tokens/s")
+        print("=" * 64)
+        return
+
+    # ---- 单序列路径(no cache / dynamic / paged)----
     # warm up
     llm.generate(["Benchmark: "], SamplingParams(temperature=0.1), use_kv_cache=use_kv_cache, use_paged_kv_cache=args.paged_kv_cache)
 
     # ---- 正式 benchmark ----
     results = []
-    for token_ids, sp in zip(prompt_token_ids, sampling_params):
+    for req_id, (token_ids, sp) in enumerate(zip(prompt_token_ids, sampling_params)):
         input_ids = torch.tensor([token_ids], dtype=torch.long, device=llm.device)
-        results.append(run_one_sequence(llm, input_ids, sp, use_kv_cache, use_paged_kv_cache=args.paged_kv_cache, sync=sync))
+        results.append(run_one_sequence(llm, input_ids, sp, req_id, use_kv_cache, use_paged_kv_cache=args.paged_kv_cache, sync=sync))
 
     # ---- 汇总指标 ----
     total_output_tokens = sum(r["output_tokens"] for r in results)
