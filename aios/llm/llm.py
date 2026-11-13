@@ -13,7 +13,8 @@ from ..engine.engine import Engine
 from ..kvcache import MHAKVCache, KVCacheLayout
 from ..scheduler import CacheManager
 from ..scheduler.table import TableManager
-from ..scheduler.scheduler import Scheduler 
+from ..scheduler.scheduler import Scheduler
+from ..scheduler.continuous import ContinuousScheduler 
 from ..core import SamplingParams, Req
 
 
@@ -81,16 +82,14 @@ class LLM:
         use_kv_cache: bool = True,
         use_paged_kv_cache: bool = False,
         use_static_batch: bool = False,
+        use_continuous_batch: bool = False,
+        max_running_reqs: int | None = None,
     ) -> List[dict]:
         # 归一化 sampling_params:统一为「每个 prompt 对应一个 SamplingParams」的列表
         if sampling_params is None:
             params_list = [SamplingParams()] * len(prompts)
-
-        if use_static_batch:
-            return self._generate_static_batch_paged(prompts, sampling_params)
-
         # Normalize to per-request sampling params list
-        if isinstance(sampling_params, SamplingParams):
+        elif isinstance(sampling_params, SamplingParams):
             params_list = [sampling_params] * len(prompts)
         else:
             # List[SamplingParams],长度需与 prompts 一致
@@ -99,6 +98,13 @@ class LLM:
             )
             params_list = sampling_params
 
+        
+        if use_continuous_batch:
+            return self._generate_continuous_batch(prompts, params_list, max_running_reqs)
+        if use_static_batch:
+            return self._generate_static_batch_paged(prompts, params_list)
+        
+        
         results = []
         for req_id, (prompt, sp) in enumerate(zip(prompts, params_list)):
             if isinstance(prompt, str):
@@ -168,15 +174,10 @@ class LLM:
     def _generate_static_batch_paged(
         self,
         prompts: List[str] | List[List[int]],
-        sampling_params: SamplingParams | List[SamplingParams],
+        params_list: List[SamplingParams] | None,
     ) -> List[dict]:
         """Static batch generation with paged KV cache ."""
-        # Normalize sampling params
-        if isinstance(sampling_params, SamplingParams):
-            params_list = [sampling_params] * len(prompts)
-        else:
-            params_list = sampling_params
-
+        
         # Tokenize all prompts -> list of 1D CPU tensors
         all_inputs_ids: List[torch.Tensor] = []
         for prompt in prompts:
@@ -228,3 +229,65 @@ class LLM:
 
         # Finalize and return results
         return scheduler.finalize_results(self.tokenizer)
+
+    @torch.no_grad()
+    def _generate_continuous_batch(
+        self,
+        prompts: List[str] | List[List[int]],
+        params_list: List[SamplingParams] | None,
+        max_running_reqs: int | None,
+    ) -> List[dict]:
+        """Continuous batching generation with paged KV cache."""
+
+        # Tokenize all prompts -> list of 1D CPU tensors
+        all_input_ids: List[torch.Tensor] = []
+        for prompt in prompts:
+            if isinstance(prompt, str):
+                messages = [{"role": "user", "content": prompt}]
+                text = self.tokenizer.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=True, enable_thinking=False
+                )
+                ids = self.tokenizer.encode(text, return_tensors="pt")[0]
+            else:
+                ids = torch.tensor(prompt)
+            all_input_ids.append(ids)
+
+        # Determine max running requests and max total length
+        if max_running_reqs is None:
+            max_running_reqs = len(prompts)
+        max_total_len = max(
+            len(ids) + sp.max_tokens
+            for ids, sp in zip(all_input_ids, params_list)
+        )
+
+        # page_table 行数 = max_running_reqs(而非请求总数),这是连续批处理的关键:
+        # 请求完成后立即释放 slot,供新请求复用。
+        page_table = torch.zeros(
+            (max_running_reqs, max_total_len), dtype=torch.int32, device=self.device
+        )
+        table_manager = TableManager(max_running_reqs, page_table)
+
+        scheduler = ContinuousScheduler(
+            table_manager=table_manager,
+            cache_manager=self.cache_manager,
+            eos_token_id=self.tokenizer.eos_token_id,
+            device=self.device,
+            max_running_reqs=max_running_reqs,
+        )
+
+        engine = Engine(model=self.model, mha_kv_cache=self.mha_kv_cache)
+
+        # 逐个入队(不一次性 init,而是 pending 队列)
+        for ids, sp in zip(all_input_ids, params_list):
+            scheduler.add_request(ids, sp)
+
+        # 主循环:prefill-first,否则 decode
+        while scheduler.has_work:
+            scheduled = scheduler.schedule_next_batch()
+            if scheduled is None:
+                break
+            next_tokens = engine.run_batch(scheduled)
+            scheduler.process_batch_output(scheduled, next_tokens)
+
+        return scheduler.collect_results(self.tokenizer)
+    

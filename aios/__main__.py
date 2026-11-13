@@ -26,11 +26,16 @@ def main():
     parser.add_argument("--paged-kv-cache", action="store_true", help="Enable lesson-6 Paged KV cache")
     parser.add_argument("--static-batch", action="store_true",
                         help="Use static batching (paged KV, batched attention)")
+    parser.add_argument("--continuous-batch", action="store_true",
+                        help="Use continuous batching (paged KV, prefill-first scheduling)")
+    parser.add_argument("--max-running-reqs", type=int, default=None,
+                        help="Max concurrent running requests (continuous batching)")
+    
     args = parser.parse_args()
 
     # 互斥检查:static-batch 隐含 paged,与 no-kv-cache 冲突
-    if args.static_batch and args.no_kv_cache:
-        parser.error("--static-batch 不能与 --no-kv-cache 同时使用(static batching 依赖 paged KV cache)")
+    if (args.static_batch or args.continuous_batch) and args.no_kv_cache:
+        parser.error("--static-batch / --continuous-batch 不能与 --no-kv-cache 同时使用(批处理依赖 paged KV cache)")
 
     prompts = args.prompt or ["Who are you?"]
 
@@ -46,7 +51,9 @@ def main():
         max_tokens=args.max_tokens,
     )
 
-    if args.static_batch:
+    if args.continuous_batch:
+        results = llm.generate(prompts, sampling_params, use_continuous_batch=True, max_running_reqs=args.max_running_reqs)
+    elif args.static_batch:
         results = llm.generate(prompts, sampling_params, use_static_batch=True)
     else:
         results = llm.generate(prompts, sampling_params, use_kv_cache=not args.no_kv_cache, use_paged_kv_cache=args.paged_kv_cache)

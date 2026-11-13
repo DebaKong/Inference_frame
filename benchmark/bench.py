@@ -10,17 +10,18 @@ from aios.engine import Sampler, DynamicKVCache
 from aios.llm import LLM
 
 
-def run_static_batch(
+def run_batched(
     llm: LLM,
     prompt_token_ids: List[List[int]],
     sampling_params: List[SamplingParams],
+    mode: str,
+    max_running_reqs: int | None = None,
     sync: bool = True,
 ) -> dict:
-    """Drive static-batch generation and collect coarse timing metrics.
+    """Drive static/continuous batching and collect coarse timing metrics.
 
-    Static batching uses prefill-first + decode-loop, so per-token TTFT/TPOT
-    are not directly measurable from the outside; we report end-to-end time,
-    throughput, and per-phase time when available.
+    Both modes use prefill-first + decode-loop, so per-token TTFT/TPOT are not
+    directly measurable from the outside; we report end-to-end time and throughput.
     """
     device = llm.device
 
@@ -28,16 +29,23 @@ def run_static_batch(
         if sync and device.type == "cuda":
             torch.cuda.synchronize()
 
-    # 转成 token id 列表(与 _generate_static_batch_paged 接受的格式一致)
     prompts = [ids for ids in prompt_token_ids]
 
     _sync()
     t_start = time.perf_counter()
-    results = llm.generate(
-        prompts,
-        sampling_params,
-        use_static_batch=True,
-    )
+    if mode == "continuous":
+        results = llm.generate(
+            prompts,
+            sampling_params,
+            use_continuous_batch=True,
+            max_running_reqs=max_running_reqs,
+        )
+    else:  # "static"
+        results = llm.generate(
+            prompts,
+            sampling_params,
+            use_static_batch=True,
+        )
     _sync()
     total_time = time.perf_counter() - t_start
 
@@ -47,6 +55,16 @@ def run_static_batch(
         "output_tokens": output_tokens,
         "results": results,
     }
+
+
+def run_static_batch(
+    llm: LLM,
+    prompt_token_ids: List[List[int]],
+    sampling_params: List[SamplingParams],
+    sync: bool = True,
+) -> dict:
+    """Drive static-batch generation and collect coarse timing metrics (back-compat wrapper)."""
+    return run_batched(llm, prompt_token_ids, sampling_params, mode="static", sync=sync)
 
 
 def run_one_sequence(
@@ -170,6 +188,8 @@ def main():
     parser.add_argument("--no-kv-cache", action="store_true", help="Disable lesson-4 KV cache path")
     parser.add_argument("--paged-kv-cache", action="store_true", help="Enable lesson-6 Paged KV cache")
     parser.add_argument("--static-batch", action="store_true", help="Enable static batching (paged KV + batched attention)")
+    parser.add_argument("--continuous-batch", action="store_true", help="Enable continuous batching (paged KV + prefill-first)")
+    parser.add_argument("--max-running-reqs", type=int, default=None, help="Max concurrent running requests (continuous batching)")
     parser.add_argument("--no-sync", action="store_true", help="Skip cuda.synchronize timing (noisier, faster)")
     args = parser.parse_args()
 
@@ -192,18 +212,23 @@ def main():
     use_kv_cache = not args.no_kv_cache
     sync = not args.no_sync
 
-    # ---- static batching 分支 ----
-    if args.static_batch:
+    # ---- static / continuous batching 分支 ----
+    if args.static_batch or args.continuous_batch:
+        mode = "continuous" if args.continuous_batch else "static"
         # warm up
-        llm.generate(["Benchmark: "], SamplingParams(temperature=0.1), use_static_batch=True)
+        if args.continuous_batch:
+            llm.generate(["Benchmark: "], SamplingParams(temperature=0.1), use_continuous_batch=True, max_running_reqs=args.max_running_reqs)
+        else:
+            llm.generate(["Benchmark: "], SamplingParams(temperature=0.1), use_static_batch=True)
 
-        res = run_static_batch(llm, prompt_token_ids, sampling_params, sync=sync)
+        res = run_batched(llm, prompt_token_ids, sampling_params, mode=mode, max_running_reqs=args.max_running_reqs, sync=sync)
         total_output_tokens = res["output_tokens"]
         total_time = res["total_time"]
         throughput = total_output_tokens / total_time
 
+        label = "CONTINUOUS_BATCH" if args.continuous_batch else "STATIC_BATCH"
         print("=" * 64)
-        print("[STATIC_BATCH] AIOS Benchmark Results")
+        print(f"[{label}] AIOS Benchmark Results")
         print("=" * 64)
         print(f"  Sequences            : {args.num_seqs}")
         print(f"  Total input tokens   : {sum(len(ids) for ids in prompt_token_ids)}")

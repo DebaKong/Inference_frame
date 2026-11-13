@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, List
 
 import torch
@@ -32,6 +32,8 @@ class Req:
     cache_handle: Any | None = None
     block_table: torch.Tensor | None = None
     table_idx: int | None = None  # TableManager row index
+    # Output tokens accumulated on-the-fly; survives immediate page free on completion.
+    generated: List[int] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         self.device_len = len(self.input_ids)

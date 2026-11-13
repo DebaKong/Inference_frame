@@ -10,24 +10,25 @@ from ..core import Batch, Req, SamplingParams
 from ..engine.sample import Sampler
 from .cache import CacheManager
 from .table import TableManager
+from .common import _ReqState, ScheduledBatch
 
 
-@dataclass
-class _ReqState:
-    """Scheduler-private per-request state."""
+# @dataclass
+# class _ReqState:
+#     """Scheduler-private per-request state."""
 
-    req: Req
-    sampler: Sampler
-    finished: bool = False
+#     req: Req
+#     sampler: Sampler
+#     finished: bool = False
 
 
-@dataclass
-class ScheduledBatch:
-    """Scheduler -> Engine execution unit."""
+# @dataclass
+# class ScheduledBatch:
+#     """Scheduler -> Engine execution unit."""
 
-    batch: Batch
-    samplers: List[Sampler] # aligned with batch.reqs
-    state_indices: List[int] # indices into Scheduler._states
+#     batch: Batch
+#     samplers: List[Sampler] # aligned with batch.reqs
+#     state_indices: List[int] # indices into Scheduler._states
 
 
 class Scheduler:
